@@ -1,0 +1,38 @@
+### Proxy ###
+
+[proxy]
+addr = "127.0.0.1:8000"
+
+## Other formats
+
+#addr = "http://127.0.0.1;8000" # Same as "127.0.0.1:8000"
+#addr = "https://127.0.0.1:8000", # Listen with TLS
+#addr = { addr = "127.0.0.1:8000", secure = true }
+
+# Specify multiple address to listen on
+#addr = [
+#  "127.0.0.1:8000",
+#  { addr = "127.0.0.1:8000", secure = false }
+#]
+
+### Paths ###
+
+[paths]
+# Bare keys are needed
+"/config.Config/Config" = "127.0.0.1:8080"
+"/config.Config/AgainConfig" = [
+  "https://127.0.0.1:8008",
+  { addr = "127.0.0.1:9000", secure = false }
+]
+
+### Addrs ###
+# This is used to specify paths for a given address
+
+[[addr]]
+addr = "https://127.0.0.1:8000"
+paths = [ "/config/HttpsConfig" ]
+
+[[addr]]
+addr = "127.0.0.1:8008"
+secure = true
+paths = [ "/config/HttpsConfig", "/config.Config/AnotherConfig" ]

@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package test;
+
+option go_package = "github.com/johnietre/grpc-proxy/tests/proto";
+
+service TestAPI {
+  // Turns lower case string into upper case
+  rpc Test(TestRequest) returns (TestResponse);
+  // Sums numbers
+  rpc TestClientStream(stream TestClientStreamRequest) returns (TestClientStreamResponse);
+  // Calculate up to the given fibonacci number
+  rpc TestServerStream(TestServerStreamRequest) returns (stream TestServerStreamResponse);
+  rpc TestBiStream(stream TestBiStreamRequest) returns (stream TestBiStreamResponse);
+
+  rpc TestBiAbsUpDown(stream TestBiStreamRequest) returns (stream TestBiStreamResponse);
+  rpc TestBiPctUpDown(stream TestBiStreamRequest) returns (stream TestBiStreamResponse);
+  rpc TestBiPct(stream TestBiStreamRequest) returns (stream TestBiStreamResponse);
+}
+
+message TestRequest {
+  string lower = 1;
+}
+
+message TestResponse {
+  string upper = 1;
+}
+
+message TestClientStreamRequest {
+  uint64 num = 1;
+}
+
+message TestClientStreamResponse {
+  uint64 sum = 1;
+}
+
+message TestServerStreamRequest {
+  uint32 fib_num = 1;
+}
+
+message TestServerStreamResponse {
+  uint64 num = 1;
+}
+
+message TestBiStreamRequest {
+  uint64 start = 1;
+  uint64 end = 2;
+  optional bool subscribe = 3;
+}
+
+message TestBiStreamResponse {
+  repeated double prices = 1;
+  uint64 start = 2;
+  uint64 end = 3;
+  optional string error = 4;
+}

@@ -1,0 +1,5 @@
+[proxy]
+addr = "127.0.0.1:8000"
+
+[[path]]
+path = "/yes/no"

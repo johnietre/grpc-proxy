@@ -1,0 +1,12 @@
+[proxy]
+addr = { addr = "127.0.0.1:13100", secure = false }
+
+[paths]
+"/test.Test" = "127.0.0.1:13101"
+"/test.TestBiStream" = { addr = "127.0.0.1:13105" }
+
+[addrs]
+"127.0.0.1:13102" = [
+  "/test.TestClientStream",
+  "/test.TestServerStream",
+]

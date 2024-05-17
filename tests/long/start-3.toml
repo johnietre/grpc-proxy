@@ -1,0 +1,8 @@
+[proxy]
+# Will fail since this is the address the permenant listener is started on
+addr = { addr = "127.0.0.1:14230", secure = false }
+[paths]
+"/test.TestBiAbsUpDown" = [ { addr = "127.0.0.1:14255", secure = false } ]
+"/test.TestBiPctUpDown" = [ "127.0.0.1:14256" ]
+[addrs]
+"http://127.0.0.1:14257" = [ "/test.TestBiPct" ]
