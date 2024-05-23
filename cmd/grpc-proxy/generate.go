@@ -31,7 +31,7 @@ func makeGenerateCmd() *cobra.Command {
 func runGenerate(cmd *cobra.Command, args []string) {
 	_, thisFile, _, _ := runtime.Caller(0)
 	defaultConfigPath := filepath.Join(
-		filepath.Dir(filepath.Dir(thisFile)),
+		filepath.Dir(filepath.Dir(filepath.Dir(thisFile))),
 		"EXAMPLE_CONFIG.toml",
 	)
 
