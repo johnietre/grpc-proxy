@@ -18,3 +18,9 @@ Currently the Go implementation is far faster than the Rust implementation (at l
 - [ ] Add more options to better control tests
 - [ ] Add tests to go directory for individual things (standard Go tests)
 - [ ] Test all that's yet to be tested
+    - [ ] Status
+- [ ] Logging
+- [ ] Add optional retry timer for srvr0 when it disconnects
+- [ ] Allow specifying paths per URL (in addition to URLs per path)
+    - Possibly add new option to "generate" command to convert paths per URL to URLs per path
+- [ ] Command to make proxy replace config at its config path with current config

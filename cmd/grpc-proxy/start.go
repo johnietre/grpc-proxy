@@ -22,8 +22,14 @@ func makeStartCmd() *cobra.Command {
 	flags.Var(&px.Addr{}, "addr", "Address to run Srvr0 on")
 	flags.String("cert", "", "Path to cert.pem file for Srvr0")
 	flags.String("key", "", "Path to key.pem file for Srvr0")
-	flags.String("global-cert", "", "Path to cert.pem file for Srvr0")
-	flags.String("global-key", "", "Path to key.pem file for Srvr0")
+	flags.String(
+    "global-cert", "",
+    "Path to cert.pem file to make available globally",
+  )
+	flags.String(
+    "global-key", "",
+    "Path to key.pem file to make available globally",
+  )
 	flags.Bool(
 		"no-password", false,
 		fmt.Sprintf(
