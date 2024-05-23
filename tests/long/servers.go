@@ -12,12 +12,86 @@ import (
 	utils "github.com/johnietre/utils/go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/resolver"
 )
 
+func init() {
+  resolver.Register(NewAddrsResolverBuilder())
+}
+
+type resolverBuilder struct {}
+
+func NewAddrsResolverBuilder() resolver.Builder {
+  return &resolverBuilder{}
+}
+
+func (rb *resolverBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts resolver.BuildOptions) (resolver.Resolver, error) {
+  addrStrs := strings.Split(target.Endpoint(), ",")
+  addrs := make([]resolver.Address, 0, len(addrStrs))
+  for _, addr := range addrStrs {
+    addrs = append(addrs, resolver.Address{
+      Addr: addr,
+    })
+  }
+  cc.UpdateState(resolver.State{
+    Endpoints: []resolver.Endpoint{resolver.Endpoint{Addresses: addrs}},
+  })
+  return &myResolver{
+    target: target,
+    cc: cc,
+  }, nil
+}
+
+func (rb *resolverBuilder) Scheme() string {
+  return "myips"
+}
+
+type myResolver struct {
+  addrs []string
+  target resolver.Target
+  cc resolver.ClientConn
+}
+
+func (mr *myResolver) ResolveNow(resolver.ResolveNowOptions) {}
+
+func (mr *myResolver) Close() {}
+
+type Conns struct {
+  conns []*grpc.ClientConn
+}
+
+func NewConns() *Conns {
+  return &Conns{}
+}
+
+func (cs *Conns) NewClient(
+  addr string,
+) (pb.TestAPIClient, *grpc.ClientConn, error) {
+  c, conn, err := newClient(addr)
+  if err == nil {
+    cs.conns = append(cs.conns, conn)
+  }
+  return c, conn, err
+}
+
+func (cs *Conns) CloseAll() {
+  for _, conn := range cs.conns {
+    conn.Close()
+  }
+  cs.conns = nil
+}
+
 func newClient(addr string) (pb.TestAPIClient, *grpc.ClientConn, error) {
-  conn, err := grpc.Dial(
+  conn, err := grpc.NewClient(
     addr,
     grpc.WithTransportCredentials(insecure.NewCredentials()),
+    grpc.WithKeepaliveParams(keepalive.ClientParameters{
+      Time: time.Second * 60,
+      Timeout: time.Second,
+      PermitWithoutStream: true,
+    }),
+    //grpc.WithResolvers(NewAddrsResolverBuilder()),
   )
   if err != nil {
     return nil, nil, nil
@@ -193,8 +267,9 @@ func (bs *biStreamServer) TestBiStream(stream pb.TestAPI_TestBiStreamServer) err
       continue
     }
     start, end := req.GetStart(), req.GetEnd()
-    if start > end {
-      resp := &pb.TestBiStreamResponse{Error: utils.NewT("invalid range")}
+    resp := &pb.TestBiStreamResponse{Start: start, End: end}
+    if start > end && end != 0 {
+      resp.Error = utils.NewT("invalid range")
       if err := stream.Send(resp); err != nil {
         return err
       }
@@ -202,7 +277,7 @@ func (bs *biStreamServer) TestBiStream(stream pb.TestAPI_TestBiStreamServer) err
     }
     startNode := bs.prices.Get(start)
     if startNode == nil {
-      resp := &pb.TestBiStreamResponse{Error: utils.NewT("invalid start")}
+      resp.Error = utils.NewT("invalid start")
       if err := stream.Send(resp); err != nil {
         return err
       }
@@ -211,19 +286,18 @@ func (bs *biStreamServer) TestBiStream(stream pb.TestAPI_TestBiStreamServer) err
     if end == start {
       end++
     }
-    prices := make([]float64, 0, end - start)
+    var prices []float64
+    if end != 0 {
+      prices = make([]float64, 0, end - start)
+    }
     startNode.RangeToTail(func(node *AtomicNode[priceTime]) bool {
-      if node.Index() == end {
+      if node.Index() == end && end != 0 {
         return false
       }
       prices = append(prices, node.Value().price)
       return true
     })
-    resp := &pb.TestBiStreamResponse{
-      Prices: prices,
-      Start: start,
-      End: start + uint64(len(prices)),
-    }
+    resp.Prices, resp.End = prices, start + uint64(len(prices))
     if err := stream.Send(resp); err != nil {
       return err
     }
@@ -265,9 +339,9 @@ func (bs *biStreamServer) run(randWalkType int) {
     walker = NewRandWalker(initial, NewAbsUpDown(ud, ud), 0.6)
   }
 
-  bs.prices.PushBack(priceTime{walker.Value(), 0})
+  t := uint64(1)
+  bs.prices.PushBack(priceTime{walker.Value(), t})
   tick := time.NewTicker(time.Second)
-  t := uint64(0)
   for range tick.C {
     t++
     pt := priceTime{walker.Next(), t}

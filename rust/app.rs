@@ -1,0 +1,1318 @@
+use crate::config::*;
+use crate::consts::{headers, targets::*};
+use crate::die;
+
+use anyhow::Result as ARes;
+use bytes::Bytes;
+use crossbeam::sync::WaitGroup;
+use dashmap::DashMap;
+use futures::future::{BoxFuture, FutureExt};
+use http_body_util::{combinators::BoxBody, BodyExt};
+use hyper::body::{Body, Frame, Incoming, SizeHint};
+use hyper::client::conn::http2::{Builder as ClientBuilder, SendRequest};
+use hyper::server::conn::http2::Builder as ServerBuilder;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::{TokioExecutor, TokioTimer};
+use log::Level;
+use pin_project::pin_project;
+use std::collections::HashMap;
+use std::error::Error as _;
+use std::io::{Error as IoError, ErrorKind};
+use std::mem;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::process::exit;
+use std::str::from_utf8 as str_from_utf8;
+use std::sync::{
+    atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering},
+    Arc,
+};
+use std::task::{Context, Poll};
+use std::time::SystemTime;
+use tokio::net::TcpSocket;
+use tokio::signal;
+use tokio::sync::{
+    oneshot::{channel as ochannel, Receiver as OReceiver, Sender as OSender},
+    watch::{channel as wchannel, Receiver as WReceiver, Sender as WSender},
+    Mutex, RwLock,
+};
+use tokio::time::{sleep, Duration};
+use utils::atomic_value::NEAtomicArcValue as NEAAV;
+
+pub struct App {
+    config_path: String,
+    config: RwLock<Config>,
+    paths: NEAAV<ProxyPaths>,
+    //paths: NEAAV<Paths>,
+    #[allow(dead_code)]
+    lb: AtomicU32,
+    next_conn_id: AtomicU64,
+
+    no_username: bool,
+    password: Arc<str>,
+
+    extra_ln_info: ExtraLnInfo,
+    extra_ln_sender: Option<WSender<SystemTime>>,
+
+    server_builder: ServerBuilder<TokioExecutor>,
+    client_builder: ClientBuilder<TokioExecutor>,
+
+    // The u64 is an ID used so that a listener can know if it needs to remove itself from the map.
+    // An example is as follows. A listener fails with some kind of error, thus it's hasn't yet
+    // been removed from map. Simultaneously, a new listener is created on the same address and
+    // placed into the map before the old is removed (but after it has decided to remove itself).
+    // Without an ID, the listener would then remove the new one, shutting it down.
+    listeners: RwLock<HashMap<Addr, (u64, OSender<()>)>>,
+    listener_id: AtomicU64,
+    wg: AtomicPtr<WaitGroup>,
+
+    #[allow(dead_code)]
+    log_handle: Option<log4rs::Handle>,
+}
+
+use types::*;
+
+type ExtraLnInfo = Option<(Addr, Option<Duration>)>;
+
+impl App {
+    pub fn new(
+        config_path: String,
+        config: Config,
+        extra_ln_info: ExtraLnInfo,
+        no_username: bool,
+        password: impl Into<Arc<str>>,
+        log_handle: Option<log4rs::Handle>,
+    ) -> ARes<Self> {
+        let paths = config.make_proxy_paths()?;
+        let lb = AtomicU32::new(config.proxy.lb.unwrap_or_default() as _);
+
+        let mut server_builder = ServerBuilder::new(TokioExecutor::new());
+        server_builder
+            .keep_alive_interval(Some(Duration::from_secs(10)))
+            .keep_alive_timeout(Duration::from_secs(60))
+            .enable_connect_protocol() // TODO: keep?
+            .adaptive_window(true)
+            .timer(TokioTimer::new());
+
+        let mut client_builder = ClientBuilder::new(TokioExecutor::new());
+        client_builder
+            .keep_alive_interval(Some(Duration::from_secs(10)))
+            .keep_alive_timeout(Duration::from_secs(60))
+            .keep_alive_while_idle(true)
+            .adaptive_window(true)
+            .timer(TokioTimer::new());
+        Ok(Self {
+            config_path,
+            config: RwLock::new(config),
+            paths: NEAAV::new(paths),
+            lb,
+            next_conn_id: AtomicU64::new(0),
+
+            no_username,
+            password: password.into(),
+
+            extra_ln_info,
+            extra_ln_sender: None,
+
+            server_builder,
+            client_builder,
+
+            listeners: RwLock::new(HashMap::new()),
+            listener_id: AtomicU64::new(0),
+            wg: AtomicPtr::new(Box::into_raw(Box::new(WaitGroup::new()))),
+
+            log_handle,
+        })
+    }
+
+    pub async fn run(mut self) {
+        let elr = if self.extra_ln_info.is_some() {
+            let (sender, rcvr) = wchannel(SystemTime::now());
+            self.extra_ln_sender = Some(sender);
+            Some(rcvr)
+        } else {
+            None
+        };
+        Box::leak::<'static>(Box::new(self)).run_leaked(elr).await
+    }
+
+    async fn run_leaked(&'static self, elr: Option<WReceiver<SystemTime>>) {
+        log::info!(target: LM_RUN, "STARTING");
+        tokio::spawn(async move {
+            handle_signals(self).await;
+        });
+        let temp_conf = Config::empty();
+        let config = mem::replace(&mut *self.config.write().await, temp_conf);
+        if let Err(e) = self.apply_config(config).await {
+            log::warn!(target: LM_RUN, "error setting config: {e}");
+        }
+        let Some(wg) = self.new_wg() else {
+            log::error!(target: LM_RUN, "error getting waitgroup in run function");
+            return;
+        };
+        if self.extra_ln_info.is_some() {
+            tokio::spawn(async move {
+                self.run_extra_ln(elr.unwrap()).await;
+            });
+        }
+        wg.wait();
+        die!(0; target: LM_RUN, Level::Info, "EXITING");
+    }
+
+    async fn run_extra_ln(&'static self, mut rcvr: WReceiver<SystemTime>) {
+        let Some((addr, retry)) = self.extra_ln_info else {
+            return;
+        };
+        loop {
+            let listener = match new_listener(addr).await {
+                Ok(ln) => ln,
+                Err(e) => {
+                    log::error!(target: LM_LISTENER, "(0|{addr}): {e}");
+                    if let Some(retry) = retry {
+                        sleep(retry).await;
+                    } else {
+                        let start = SystemTime::now();
+                        loop {
+                            if rcvr.changed().await.is_err() {
+                                // TODO: Error msg
+                                log::error!(target: LM_LISTENER, "extra listener sender dropped");
+                                return;
+                            }
+                            let t = *rcvr.borrow_and_update();
+                            if t >= start {
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            };
+            log::info!(target: LM_LISTENER, "(0|{addr}): started");
+            let res: ARes<()> = loop {
+                let (stream, raddr) = match listener.accept().await {
+                    Ok((stream, raddr)) => (HyperIo::new(stream), raddr),
+                    Err(e) => break Err(e.into()),
+                };
+                self.handle_stream(stream, raddr, None).await;
+            };
+            if let Err(e) = res {
+                log::error!(target: LM_LISTENER, "(0|{addr}): {e}");
+            } else {
+                log::error!(target: LM_LISTENER, "(0|{addr}): stopped without error");
+            }
+        }
+    }
+
+    // TODO: Backlog?
+    async fn run_listener(&'static self, addr: Addr) {
+        let Some(_wg) = self.new_wg() else {
+            return;
+        };
+
+        let listener = match new_listener(addr).await {
+            Ok(ln) => ln,
+            Err(e) => {
+                log::warn!(target: LM_LISTENER, "({addr}): {e}");
+                return;
+            }
+        };
+        let (send, done) = ochannel();
+        let id = {
+            let mut listeners = self.listeners.write().await;
+            let mut id = 0;
+            let ids = listeners.values().map(|(id, _)| *id).collect::<Vec<_>>();
+            while id == 0 || ids.contains(&id) {
+                id = self.listener_id.fetch_add(1, Ordering::Relaxed);
+            }
+            listeners.insert(addr, (id, send));
+            id
+        };
+
+        log::info!(target: LM_LISTENER, "({id}|{addr}): started");
+        let res = self.serve(listener, addr, id, done).await;
+        log::info!(target: LM_LISTENER, "({id}|{addr}): completed");
+        // If no error, then the listener was shutdown externally
+        let Err(e) = res else {
+            return;
+        };
+        let mut listeners = self.listeners.write().await;
+        if let Some((lid, os)) = listeners.remove(&addr) {
+            if lid != id {
+                // Insert the oneshot sender back if not the correct one
+                listeners.insert(addr, (lid, os));
+            }
+        }
+        drop(listeners);
+        log::warn!(target: LM_LISTENER, "({id}|{addr}): {e}");
+    }
+
+    async fn serve(
+        &'static self,
+        listener: TcpListener,
+        _addr: Addr,
+        _id: u64,
+        mut done: OReceiver<()>,
+    ) -> ARes<()> {
+        loop {
+            tokio::select! {
+                res = listener.accept() => {
+                    let (stream, raddr) = match res {
+                        Ok((stream, raddr)) => (HyperIo::new(stream), raddr),
+                        Err(e) => break Err(e.into()),
+                    };
+                    let Some(wg) = self.new_wg() else {
+                        break Ok(())
+                    };
+                    self.handle_stream(stream, raddr, Some(wg)).await;
+                }
+                _ = &mut done => break Ok(()),
+            }
+        }
+    }
+
+    async fn handle_stream(
+        &'static self,
+        stream: HyperIo<TcpStream>,
+        raddr: SocketAddr,
+        wg: Option<WaitGroup>,
+    ) {
+        let target = if wg.is_some() {
+            LM_SERVE
+        } else {
+            LM_SERVE_PROXY
+        };
+        let conn_id = self.new_conn_id();
+        let conns = Arc::new(DashMap::new());
+        let num_reqs = Arc::new(AtomicU64::new(0));
+        let pool = Arc::new(Pool::new());
+        let svc = service_fn(move |req| {
+            self.new_handler(
+                conn_id,
+                Arc::clone(&conns),
+                Arc::clone(&num_reqs),
+                Arc::clone(&pool),
+            )
+            .proxy(req)
+        });
+        tokio::spawn(async move {
+            log::trace!(target: target, "CONN_ID={conn_id} RADDR={raddr}");
+            let _wg = wg;
+            let Err(e) = self
+                .server_builder
+                .clone()
+                .serve_connection(stream, svc)
+                .await
+            else {
+                log::trace!(target: target, "{conn_id}");
+                return;
+            };
+            if let Some(ioe) = e.source().and_then(|s| s.downcast_ref::<IoError>()) {
+                if ioe.kind() == ErrorKind::NotConnected {
+                    log::trace!(target: target, "{conn_id}");
+                    return;
+                }
+            }
+            log::info!(target: target, "{conn_id}: {e}");
+        });
+    }
+
+    fn new_conn_id(&'static self) -> u64 {
+        self.next_conn_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn new_handler(
+        &'static self,
+        conn_id: u64,
+        conns: PathConns,
+        num_reqs: Arc<AtomicU64>,
+        pool: Arc<Pool<SendRequest<Incoming>>>,
+    ) -> Handler {
+        Handler {
+            app: self,
+            conn_id,
+            conns,
+            num_reqs,
+            pool,
+        }
+    }
+
+    fn apply_config(&'static self, config: Config) -> BoxFuture<'static, ARes<()>> {
+        async move {
+            self.check_shutting_down()?;
+            // Get the proxy addrs and paths
+            let mut proxy_addrs = config.proxy.make_addrs()?;
+            let paths = config.make_proxy_paths()?;
+            let mut conf = self.config.write().await;
+            // Only keep the address that aren't already running
+            {
+                let mut listeners = self.listeners.write().await;
+                listeners.retain(|addr, _| proxy_addrs.contains(addr));
+                proxy_addrs.retain(|addr| !listeners.contains_key(addr));
+            }
+            // Start the new listeners
+            for addr in proxy_addrs {
+                tokio::spawn(async move {
+                    self.run_listener(addr).await;
+                });
+            }
+            // Set the config and paths
+            *conf = config;
+            self.set_paths(paths);
+            // Make sure it's not shutting down
+            if self.shutting_down() {
+                self.listeners.write().await.clear();
+                return Err(anyhow::anyhow!("shutting down"));
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn add_to_config(&'static self, config: Config) -> BoxFuture<'static, ARes<()>> {
+        let Config {
+            proxy,
+            paths,
+            addrs,
+        } = config;
+        async move {
+            self.check_shutting_down()?;
+            // Get the proxy addrs
+            let mut proxy_addrs = proxy.make_addrs()?;
+            let mut conf = self.config.write().await;
+            // Add the new stuff to the config
+            let mut new_config = conf.clone();
+            for (path, addr) in paths {
+                let _ = new_config.add_path(path, addr);
+            }
+            for addr in addrs {
+                let _ = new_config.add_addr(addr);
+            }
+            // Get the paths
+            let paths = new_config.make_proxy_paths()?;
+            // Only keep the address that aren't already running
+            {
+                let listeners = self.listeners.read().await;
+                proxy_addrs.retain(|addr| !listeners.contains_key(addr));
+            }
+            // Start the new listeners
+            for addr in proxy_addrs {
+                tokio::spawn(async move {
+                    self.run_listener(addr).await;
+                });
+            }
+            // Set the config and paths
+            *conf = new_config;
+            self.set_paths(paths);
+            // Make sure it's not shutting down
+            if self.shutting_down() {
+                self.listeners.write().await.clear();
+                return Err(anyhow::anyhow!("shutting down"));
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn del_from_config(&'static self, config: Config) -> BoxFuture<'static, ARes<()>> {
+        let Config {
+            proxy,
+            paths,
+            addrs,
+        } = config;
+        async move {
+            self.check_shutting_down()?;
+            // Get the proxy addrs
+            let proxy_addrs = proxy.make_addrs()?;
+            let mut conf = self.config.write().await;
+            // Delete the new stuff from the config
+            let mut new_config = conf.clone();
+            for (path, addr) in paths {
+                let _ = new_config.del_path(&path, Some(&addr));
+            }
+            for addr in addrs {
+                let _ = new_config.del_addr(&addr);
+            }
+            // Get the paths
+            let paths = new_config.make_proxy_paths()?;
+            // Stop the appropriate listeners
+            {
+                let mut listeners = self.listeners.write().await;
+                listeners.retain(|addr, _| proxy_addrs.contains(addr));
+            }
+            // Set the config and paths
+            *conf = new_config;
+            self.set_paths(paths);
+            // Make sure it's not shutting down
+            if self.shutting_down() {
+                self.listeners.write().await.clear();
+                return Err(anyhow::anyhow!("shutting down"));
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn check_shutting_down(&'static self) -> ARes<()> {
+        if self.shutting_down() {
+            Err(anyhow::anyhow!("shutting down"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn paths(&'static self) -> Arc<ProxyPaths> {
+        //unsafe { Arc::clone(&*self.paths.load(Ordering::Acquire)) }
+        self.paths.load(Ordering::Acquire)
+    }
+
+    fn set_paths(&'static self, paths: ProxyPaths) {
+        /*
+        let ptr = Box::into_raw(Box::new(Arc::new(paths)));
+        let _ = unsafe { Box::from_raw(self.paths.swap(ptr, Ordering::AcqRel)) };
+        */
+        self.paths.store(paths, Ordering::SeqCst);
+    }
+
+    fn new_wg(&'static self) -> Option<WaitGroup> {
+        let ptr = self.wg.load(Ordering::Acquire);
+        if ptr.is_null() {
+            None
+        } else {
+            unsafe { Some((*ptr).clone()) }
+        }
+    }
+
+    fn shutting_down(&'static self) -> bool {
+        self.wg.load(Ordering::Acquire).is_null()
+    }
+
+    async fn shutdown(&'static self) {
+        tokio::spawn(async move {
+            let ptr = self.wg.swap(std::ptr::null_mut(), Ordering::AcqRel);
+            if ptr.is_null() {
+                return;
+            }
+            let _wg = unsafe { Box::from_raw(ptr) };
+            // TODO: Target?
+            log::info!(target: LM_RUN, "SHUTTING DOWN");
+            self.listeners.write().await.clear();
+        });
+    }
+}
+
+type PathConns = Arc<DashMap<Arc<str>, SendRequest<Incoming>>>;
+
+struct Handler {
+    app: &'static App,
+    conn_id: u64,
+    conns: PathConns,
+    num_reqs: Arc<AtomicU64>,
+    #[allow(dead_code)]
+    pool: Arc<Pool<SendRequest<Incoming>>>,
+}
+
+impl Handler {
+    async fn proxy(self, req: Request<Incoming>) -> RespRes {
+        static REQ_MS: AtomicU64 = AtomicU64::new(0);
+
+        let path = req.uri().path();
+        if path == "/" || path == "" {
+            return self.handle_req(req).await;
+        }
+
+        // TODO: Delete
+        let id = new_id();
+        log::trace!(target: "grpc_proxy::inspect_io::proxy", "{id} start proxy");
+
+        let conn_id = self.conn_id;
+        let req_num = self.num_reqs.fetch_add(1, Ordering::Relaxed) + 1;
+        log::trace!(target: LM_PROXY, "{conn_id}: REQ_NUM={req_num} PATH={path} STARTED");
+        let mut opt_sender = None;
+        if let Some(sender) = self.conns.get(path) {
+            if !sender.is_closed() {
+                opt_sender = Some(sender.clone());
+            }
+        }
+        if opt_sender.is_none() {
+            let (path, addr, stream) = 'stream: {
+                let paths = self.app.paths();
+                let Some((path, addrs)) = paths.get_key_value(path) else {
+                    return empty_resp(StatusCode::NOT_FOUND);
+                };
+                for addr in addrs {
+                    if addr.secure {
+                        // TODO: Secure/TLS
+                        continue;
+                    }
+                    match TcpStream::connect(addr.addr).await {
+                        Ok(stream) => {
+                            break 'stream (Arc::clone(path), *addr, HyperIo::new(stream))
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                target: LM_PROXY_CONNECT,
+                                "error connecting to {addr} ({path}): {e}",
+                            );
+                        }
+                    }
+                }
+                return empty_resp(StatusCode::SERVICE_UNAVAILABLE); // NOTE: 500, 502, or 503?
+            };
+
+            // TODO: Do something with error?
+            log::trace!(target: LM_PROXY, "{conn_id}: ADDR={addr}");
+            let (sender, conn) = self.app.client_builder.clone().handshake(stream).await?;
+            tokio::spawn(async move {
+                if let Err(e) = conn.await {
+                    // TODO: Do something with error
+                    log::info!(target: LM_PROXY, "{conn_id}: REQ_ID={req_num} ERROR={e}");
+                }
+            });
+            opt_sender = Some(self.conns.entry(path).or_insert(sender).clone());
+        }
+        let mut sender = opt_sender.unwrap();
+        let start = std::time::Instant::now();
+        // TODO: do something with error?
+        sender.ready().await?;
+        let resp = sender.send_request(req).await?;
+        let dur = start.elapsed().as_millis() as u32 as u64;
+        log::trace!(target: "grpc_proxy::inspect_io::proxy", "{id} finish proxy");
+
+        let v = REQ_MS.fetch_add((1u64 << 32) | dur, Ordering::SeqCst);
+        // Take average after at least 10 requests have occurred.
+        if v > 0x0000000a_00000000 {
+            let v = REQ_MS.swap(0, Ordering::SeqCst);
+            let ms = v as u32 as f64;
+            let num = (v >> 32) as f64;
+            //log::trace!(target: "grpc_proxy::inspect_io::");
+            eprintln!("Avg: {} ms/req", ms / num);
+        }
+
+        /*
+        let mut opt_sender = self.pool.get().await;
+        if opt_sender.is_none() {
+            let stream = match TcpStream::connect("127.0.0.1:14250").await {
+                Ok(stream) => HyperIo::new(stream),
+                Err(e) => {
+                    log::warn!(target: LM_PROXY_CONNECT, "connecting");
+                    return empty_resp(StatusCode::SERVICE_UNAVAILABLE);
+                }
+            };
+            let (sender, conn) = self.app.client_builder.handshake(stream).await?;
+            tokio::spawn(async move {
+                if let Err(e) = conn.await {
+                    // TODO: Do something with error
+                    log::info!(target: LM_PROXY, "{conn_id}: REQ_ID={req_num} ERROR={e}");
+                }
+            });
+            opt_sender = Some(sender);
+        }
+        let sender_dur = start.elapsed();
+
+        // TODO: Do something with error?
+        let start = std::time::Instant::now();
+        //let resp = opt_sender.unwrap().send_request(req).await?;
+        let mut sender = opt_sender.unwrap();
+        let resp = sender.send_request(req).await?;
+        self.pool.put(sender).await;
+        let req_dur = start.elapsed();
+        */
+        /*
+        eprintln!(
+            "TIME: SENDER: {} ms, GET: {} ms, SENDER/REQ RATIO: {}",
+            sender_dur.as_secs_f64() * 1000.0, req_dur.as_secs_f64() * 1000.0,
+            sender_dur.as_secs_f64() / req_dur.as_secs_f64(),
+        );
+        */
+
+        log::trace!(target: LM_PROXY, "{conn_id}: REQ_ID={req_num} FINISHED");
+        Ok(resp.map(|b| b.boxed()))
+    }
+
+    async fn handle_req(self, req: Request<Incoming>) -> RespRes {
+        //use hyper::header::HeaderValue;
+        //const EMPTY_HEADER_VAL: &HeaderValue = &HeaderValue::from_static("");
+
+        let Some(val) = req.headers().get(headers::BASE) else {
+            return make_resp(StatusCode::BAD_REQUEST, String::from("missing header"));
+        };
+        if self.app.password.len() != 0 {
+            let ok = if let Some(pwd) = req.headers().get(headers::PASSWORD) {
+                pwd == &*self.app.password
+            } else {
+                false
+            };
+            if !ok {
+                return make_resp(StatusCode::UNAUTHORIZED, String::from("invalid password"));
+            }
+        }
+        if !self.app.no_username {
+            let username = req
+                .headers()
+                .get(headers::USERNAME)
+                .map(|hv| hv.to_str().unwrap_or(""))
+                .unwrap_or("");
+            log::debug!(target: LM_HANDLE_REQ, "USERNAME: {username}");
+        }
+        match req.method() {
+            &Method::GET => {
+                if val != "get" {
+                    make_resp(
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            r#"expected value "get", got {val:?} for {} header"#,
+                            headers::BASE,
+                        ),
+                    )
+                } else {
+                    self.handle_get(req).await
+                }
+            }
+            &Method::POST => {
+                if val != "refresh" {
+                    make_resp(
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            r#"expected value "get", got {val:?} for {} header"#,
+                            headers::BASE,
+                        ),
+                    )
+                } else {
+                    self.handle_refresh(req).await
+                }
+            }
+            // TODO: This won't get called a second time if a force is needed since the first
+            // call SHOULD have initiated the shutdown, thus not allowing new connections.
+            &Method::DELETE => {
+                if val != "shutdown" {
+                    make_resp(
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            r#"expected value "get", got {val:?} for {} header"#,
+                            headers::BASE,
+                        ),
+                    )
+                } else {
+                    self.handle_shutdown(req).await
+                }
+            }
+            _ => empty_resp(StatusCode::METHOD_NOT_ALLOWED),
+        }
+    }
+
+    async fn handle_get(self, req: Request<Incoming>) -> RespRes {
+        let (mut get_config, mut get_status) = (false, false);
+        let Some(query) = req.uri().query() else {
+            return empty_resp(StatusCode::OK);
+        };
+        for (key, val) in query
+            .split('&')
+            .map(|kv| kv.split_once('=').unwrap_or((kv, "")))
+        {
+            if key == "config" {
+                match val {
+                    "1" | "true" => get_config = true,
+                    "0" | "false" => get_config = false,
+                    _ => (),
+                }
+            } else if key == "status" {
+                match val {
+                    "1" | "true" => get_status = true,
+                    "0" | "false" => get_status = false,
+                    _ => (),
+                }
+            }
+        }
+        let config_str = if get_config {
+            match toml::to_string(&*self.app.config.read().await) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::info!(target: LM_HANDLE_GET, "error serializing config: {e}");
+                    return make_resp(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("error serializing config: {e}"),
+                    );
+                }
+            }
+        } else {
+            String::new()
+        };
+        let status_str = if get_status {
+            let statuses = self
+                .app
+                .listeners
+                .read()
+                .await
+                .keys()
+                .map(|addr| (addr.to_string(), "RUNNING"))
+                .collect::<HashMap<_, _>>();
+            match serde_json::to_string(&statuses) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::info!(target: LM_HANDLE_GET, "error serializing statuses: {e}");
+                    return make_resp(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("error serializing statuses: {e}"),
+                    );
+                }
+            }
+        } else {
+            String::new()
+        };
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(headers::BASE, "ok")
+            .header(headers::CONFIG_LEN, config_str.len().to_string())
+            .header(headers::STATUS_LEN, status_str.len().to_string())
+            .body(make_body(Bytes::from(config_str + &status_str)))
+            .unwrap())
+    }
+
+    async fn handle_refresh(self, req: Request<Incoming>) -> RespRes {
+        let action = match req.headers().get(headers::REFRESH_ACTION) {
+            Some(v) if v == "" || v == "add" || v == "del" => v.to_str().unwrap().to_string(),
+            Some(val) => {
+                return make_resp(
+                    StatusCode::BAD_REQUEST,
+                    format!(r#"invalid value {val:?} for "{}""#, headers::REFRESH_ACTION),
+                )
+            }
+            None => {
+                return make_resp(
+                    StatusCode::BAD_REQUEST,
+                    format!(r#"missing "{}" header"#, headers::REFRESH_ACTION),
+                )
+            }
+        };
+        let body_bytes = match req.into_body().collect().await {
+            Ok(body) => body.to_bytes(),
+            Err(e) => {
+                log::debug!(target: LM_HANDLE_REFRESH, "{e}");
+                return empty_resp(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        };
+        let Ok(body_str) = str_from_utf8(&body_bytes) else {
+            return make_resp(StatusCode::BAD_REQUEST, String::from("invalid body"));
+        };
+        let config = if body_str == "" {
+            match Config::from_file(&self.app.config_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    return make_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+                }
+            }
+        } else {
+            match toml::from_str(body_str).map_err(|e| anyhow::anyhow!("{e}")) {
+                Ok(c) => c,
+                Err(e) => {
+                    return make_resp(StatusCode::BAD_REQUEST, e.to_string());
+                }
+            }
+        };
+        if action == "add" {
+            if let Err(e) = self.app.add_to_config(config).await {
+                return make_resp(StatusCode::BAD_REQUEST, e.to_string());
+            }
+        } else if action == "del" {
+            if let Err(e) = self.app.del_from_config(config).await {
+                return make_resp(StatusCode::BAD_REQUEST, e.to_string());
+            }
+        } else {
+            if let Err(e) = self.app.apply_config(config).await {
+                return make_resp(StatusCode::BAD_REQUEST, e.to_string());
+            }
+        }
+        let config_str = match toml::to_string(&*self.app.config.read().await) {
+            Ok(s) => s,
+            Err(e) => {
+                log::info!(target: LM_HANDLE_REFRESH, "error serializing config: {e}");
+                return make_resp(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("error serializing config: {e}"),
+                );
+            }
+        };
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(headers::BASE, "ok")
+            .header(headers::REFRESH_ACTION, action)
+            .header(headers::CONFIG_LEN, config_str.len().to_string())
+            .body(make_body(Bytes::from(config_str)))
+            .unwrap())
+    }
+
+    async fn handle_shutdown(self, req: Request<Incoming>) -> RespRes {
+        let force = req
+            .uri()
+            .query()
+            .map(|qs| {
+                qs.split('&')
+                    .any(|kv| kv == "force=1" || kv == "force=true")
+            })
+            .unwrap_or(false);
+        if force {
+            // TODO: Do better?
+            die!(0; target: LM_HANDLE_SHUTDOWN, Level::Info, "EXITING");
+        }
+        self.app.shutdown().await;
+        empty_resp(StatusCode::OK)
+    }
+}
+
+// RESP/BODY
+
+pub type Resp = Response<BoxBody<Bytes, hyper::Error>>;
+//pub type Resp = Response<RespBody>;
+type RespRes = Result<Resp, hyper::Error>;
+
+pub fn empty_body() -> BoxBody<Bytes, hyper::Error> {
+    BoxBody::new(EmptyBody)
+}
+
+fn make_body(body: impl Into<BytesBody>) -> BoxBody<Bytes, hyper::Error> {
+    BoxBody::new(body.into())
+}
+
+fn empty_resp(status: StatusCode) -> RespRes {
+    let hv = if status == StatusCode::OK {
+        "ok"
+    } else {
+        "err"
+    };
+    Ok(Response::builder()
+        .status(status)
+        .header(headers::BASE, hv)
+        .body(empty_body())
+        .unwrap())
+}
+
+fn make_resp(status: StatusCode, body: impl Into<Bytes>) -> RespRes {
+    let hv = if status == StatusCode::OK {
+        "ok"
+    } else {
+        "err"
+    };
+    Ok(Response::builder()
+        .status(status)
+        .header(headers::BASE, hv)
+        .body(make_body(body.into()))
+        .unwrap())
+}
+
+/*
+#[pin_project(project = RespBodyProj)]
+enum RespBody {
+    Boxed(#[pin] BoxBody<Bytes, hyper::Error>),
+    Incoming(#[pin] Incoming),
+}
+
+impl<T: Into<BoxBody<Bytes, hyper::Error>>> From<T> for RespBody {
+    fn from(t: T) -> Self {
+        RespBody::Boxed(t.into())
+    }
+}
+
+impl From<Incoming> for RespBody {
+    fn from(i: Incoming) -> Self {
+        RespBody::Incoming(i)
+    }
+}
+
+impl Body for RespBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx:  &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match self.project() {
+            RespBodyProj::Boxed(body) => body.poll_frame(cx),
+            RespBodyProj::Incoming(body) => body.poll_frame(cx),
+        }
+    }
+}
+*/
+
+struct BytesBody(Bytes);
+
+impl From<Bytes> for BytesBody {
+    fn from(b: Bytes) -> Self {
+        Self(b)
+    }
+}
+
+impl Body for BytesBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if !self.0.is_empty() {
+            let b = mem::take(&mut self.0);
+            Poll::Ready(Some(Ok(Frame::data(b))))
+        } else {
+            Poll::Ready(None)
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.0.len() as u64)
+    }
+}
+
+struct EmptyBody;
+
+impl Body for EmptyBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        Poll::Ready(None)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        true
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(0)
+    }
+}
+
+/***  Signal Handling ***/
+
+#[cfg(unix)]
+async fn handle_signals(app: &'static App) {
+    use signal::unix as signal;
+    let mut ctrlc_sig = match signal::signal(signal::SignalKind::interrupt()) {
+        Ok(sig) => sig,
+        Err(e) => die!(1; target: LM_SIGNALS, Level::Error, "error creating ctrl-c listener: {e}"),
+    };
+    let mut user1_sig = match signal::signal(signal::SignalKind::user_defined1()) {
+        Ok(sig) => sig,
+        Err(e) => die!(1; target: LM_SIGNALS, Level::Error, "error creating USR1 listener: {e}"),
+    };
+    let mut user2_sig = match signal::signal(signal::SignalKind::user_defined2()) {
+        Ok(sig) => sig,
+        Err(e) => die!(1; target: LM_SIGNALS, Level::Error, "error creating USR2 listener: {e}"),
+    };
+    let mut exiting = false;
+    loop {
+        tokio::select! {
+            ret = ctrlc_sig.recv() => {
+                if ret.is_none() {
+                    log::error!(
+                        target: LM_SIGNALS,
+                        "error listening for ctrl-c: no more events can be received",
+                    );
+                    break;
+                } else if exiting {
+                    break;
+                }
+                exiting = true;
+                app.shutdown().await;
+            }
+            ret = user1_sig.recv() => {
+                if ret.is_none() {
+                    log::error!(
+                        target: LM_SIGNALS,
+                        "error listening for USR1: no more events can be received",
+                    );
+                }
+                if let Some(sender) = app.extra_ln_sender.as_ref() {
+                    if sender.send(SystemTime::now()).is_err() {
+                        log::error!(target: LM_SIGNALS, "extra listener watcher is closed");
+                    }
+                }
+            }
+            ret = user2_sig.recv() => {
+                if ret.is_none() {
+                    log::error!(
+                        target: LM_SIGNALS,
+                        "error listening for USR2: no more events can be received",
+                    );
+                }
+                // TODO
+            }
+        }
+    }
+    exit(0);
+}
+
+#[cfg(not(unix))]
+async fn handle_signals(app: &'static App) {
+    let mut exiting = false;
+    loop {
+        if let Err(e) = signal::ctrl_c().await {
+            die!(1; target: LM_SIGNALS, Level::Error, "error listening for ctrl-c: {e}");
+        }
+        if exiting {
+            break;
+        }
+        exiting = false;
+        app.shutdown().await;
+    }
+    exit(0);
+}
+
+#[allow(dead_code)]
+struct Pool<T> {
+    pool: Mutex<Vec<T>>,
+}
+
+#[allow(dead_code)]
+impl<T> Pool<T> {
+    fn new() -> Self {
+        Self {
+            pool: Mutex::new(Vec::new()),
+        }
+    }
+
+    async fn get(&self) -> Option<T> {
+        self.pool.lock().await.pop()
+    }
+
+    async fn put(&self, value: T) {
+        self.pool.lock().await.push(value);
+    }
+}
+
+#[cfg(feature = "async-stream")]
+mod types {
+    use async_std::io::{Read as AsyncRead, Write as AsyncWrite};
+    pub use async_std::net::{TcpListener, TcpStream};
+
+    use super::*;
+    //pub use super::AsyncIo as HyperIo;
+    pub type HyperIo<T> = AsyncIo<T>;
+
+    pub async fn new_listener(addr: Addr) -> ARes<TcpListener> {
+        let sock = if addr.addr.is_ipv4() {
+            TcpSocket::new_v4()?
+        } else {
+            TcpSocket::new_v6()?
+        };
+        sock.set_reuseaddr(true)?;
+        sock.bind(addr.addr)?;
+        Ok(sock.listen(128)?.into_std()?.into())
+    }
+
+    #[pin_project]
+    #[derive(Debug)]
+    pub struct AsyncIo<T> {
+        #[pin]
+        inner: T,
+    }
+
+    impl<T> AsyncIo<T> {
+        pub fn new(inner: T) -> Self {
+            Self { inner }
+        }
+    }
+
+    impl<T: AsyncRead> hyper::rt::Read for AsyncIo<T> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            mut buf: hyper::rt::ReadBufCursor<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            let n = unsafe {
+                match AsyncRead::poll_read(self.project().inner, cx, mem::transmute(buf.as_mut())) {
+                    Poll::Ready(Ok(n)) => n,
+                    other => return other.map(|r| r.map(|_| ())),
+                }
+            };
+
+            unsafe {
+                buf.advance(n);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl<T: AsyncWrite> hyper::rt::Write for AsyncIo<T> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            AsyncWrite::poll_write(self.project().inner, cx, buf)
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            AsyncWrite::poll_flush(self.project().inner, cx)
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            AsyncWrite::poll_close(self.project().inner, cx)
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bufs: &[std::io::IoSlice<'_>],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            AsyncWrite::poll_write_vectored(self.project().inner, cx, bufs)
+        }
+    }
+}
+
+//#[cfg(not(feature = "async-stream"))]
+#[cfg(feature = "tokio-stream")]
+mod types {
+    use super::*;
+    pub use hyper_util::rt::TokioIo as HyperIo;
+    pub use tokio::net::{TcpListener, TcpStream};
+
+    pub async fn new_listener(addr: Addr) -> ARes<TcpListener> {
+        let sock = if addr.addr.is_ipv4() {
+            TcpSocket::new_v4()?
+        } else {
+            TcpSocket::new_v6()?
+        };
+        sock.set_reuseaddr(true)?;
+        sock.bind(addr.addr)?;
+        sock.listen(128).map_err(|e| e.into())
+    }
+}
+
+mod types {
+    use super::*;
+    pub use tokio::net::{TcpListener, TcpStream};
+
+    pub type HyperIo<T> = InspectIo<T>;
+
+    const READ_TARGET: &str = "grpc_proxy::inspect_io::read";
+    const WRITE_TARGET: &str = "grpc_proxy::inspect_io::write";
+    pub static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    pub async fn new_listener(addr: Addr) -> ARes<TcpListener> {
+        let sock = if addr.addr.is_ipv4() {
+            TcpSocket::new_v4()?
+        } else {
+            TcpSocket::new_v6()?
+        };
+        sock.set_reuseaddr(true)?;
+        sock.bind(addr.addr)?;
+        sock.listen(128).map_err(|e| e.into())
+    }
+
+    #[pin_project]
+    #[derive(Debug)]
+    pub struct InspectIo<T> {
+        #[pin]
+        inner: T,
+    }
+
+    impl InspectIo<TcpStream> {
+        pub fn new(inner: TcpStream) -> Self {
+            Self { inner }
+        }
+    }
+
+    impl<T> hyper::rt::Read for InspectIo<T>
+    where
+        T: tokio::io::AsyncRead,
+    {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            mut buf: hyper::rt::ReadBufCursor<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            let id = new_id();
+            log::trace!(target: READ_TARGET, "{id} start read");
+            let n = unsafe {
+                let mut tbuf = tokio::io::ReadBuf::uninit(buf.as_mut());
+                match tokio::io::AsyncRead::poll_read(self.project().inner, cx, &mut tbuf) {
+                    Poll::Ready(Ok(())) => tbuf.filled().len(),
+                    other => {
+                        log::trace!(target: READ_TARGET, "{id} finish read");
+                        return other;
+                    }
+                }
+            };
+
+            unsafe {
+                buf.advance(n);
+            }
+            log::trace!(target: READ_TARGET, "{id} finish read");
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl<T> hyper::rt::Write for InspectIo<T>
+    where
+        T: tokio::io::AsyncWrite,
+    {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            let id = new_id();
+            log::trace!(target: WRITE_TARGET, "{id} start write");
+            let res = tokio::io::AsyncWrite::poll_write(self.project().inner, cx, buf);
+            log::trace!(target: WRITE_TARGET, "{id} finish write");
+            res
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            let id = new_id();
+            log::trace!(target: WRITE_TARGET, "{id} start flush");
+            let res = tokio::io::AsyncWrite::poll_flush(self.project().inner, cx);
+            log::trace!(target: WRITE_TARGET, "{id} finish flush");
+            res
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            let id = new_id();
+            log::trace!(target: WRITE_TARGET, "{id} start shutdown");
+            let res = tokio::io::AsyncWrite::poll_shutdown(self.project().inner, cx);
+            log::trace!(target: WRITE_TARGET, "{id} finish shutdown");
+            res
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            tokio::io::AsyncWrite::is_write_vectored(&self.inner)
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bufs: &[std::io::IoSlice<'_>],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            let id = new_id();
+            log::trace!(target: WRITE_TARGET, "{id} start write_vectored");
+            let res = tokio::io::AsyncWrite::poll_write_vectored(self.project().inner, cx, bufs);
+            log::trace!(target: WRITE_TARGET, "{id} finish write_vectored");
+            res
+        }
+    }
+
+    pub fn new_id() -> u64 {
+        ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+    }
+}

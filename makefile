@@ -1,3 +1,8 @@
+.PHONY: go
+
+go:
+	go build -o bin/grpc-proxy ./cmd
+
 test-proto: tests/proto/*.proto
 	protoc \
 		--go_out=. --go-grpc_out=. \

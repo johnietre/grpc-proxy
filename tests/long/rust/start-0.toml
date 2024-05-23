@@ -1,0 +1,35 @@
+[proxy]
+addr = [
+  { addr = "127.0.0.1:14201", secure = false },
+  "http://127.0.0.1:14202",
+  { addr = "127.0.0.1:14203", secure = false },
+  "http://127.0.0.1:14204",
+]
+[paths]
+"/test.TestAPI/Test" = [ "127.0.0.1:14251" ]
+"/test.TestAPI/TestClientStream" = [ "127.0.0.1:14252" ]
+"/test.TestAPI/TestServerStream" = [ "127.0.0.1:14253" ]
+"/test.TestAPI/TestBiStream" = [ "127.0.0.1:14254" ]
+"/test.TestAPI/TestBiAbsUpDown" = [ "127.0.0.1:14255" ]
+"/test.TestAPI/TestBiPctUpDown" = [ "127.0.0.1:14256" ]
+"/test.TestAPI/TestBiPct" = [ "127.0.0.1:14257" ]
+[addrs]
+"127.0.0.1:14250" = [
+  "/test.TestAPI/Test",
+  "/test.TestAPI/TestClientStream",
+  "/test.TestAPI/TestServerStream",
+  "/test.TestAPI/TestBiStream",
+  "/test.TestAPI/TestBiAbsUpDown",
+  "/test.TestAPI/TestBiPctUpDown",
+  "/test.TestAPI/TestBiPct",
+]
+"127.0.0.1:14258" = [
+  "/test.TestAPI/TestClientStream",
+  "/test.TestAPI/TestClientServer",
+]
+"127.0.0.1:14259" = [
+  "/test.TestAPI/Test",
+  "/test.TestAPI/TestClientStream",
+  "/test.TestAPI/TestServerStream",
+  "/test.TestAPI/TestBiStream",
+]

@@ -1,0 +1,51 @@
+[grpc-proxy]
+listeners = [
+  { addr = "127.0.0.1:14223" },
+  { addr = "127.0.0.1:14224" },
+]
+
+[path."/test.TestAPI/Test"]
+urls = [
+  "http://127.0.0.1:14250",
+  "http://127.0.0.1:14251",
+  "http://127.0.0.1:14259",
+]
+
+[path."/test.TestAPI/TestClientStream"]
+urls = [
+  "http://127.0.0.1:14250",
+  "http://127.0.0.1:14258",
+  "http://127.0.0.1:14259",
+]
+
+[path."/test.TestAPI/TestServerStream"]
+urls = [
+  "http://127.0.0.1:14250",
+  "http://127.0.0.1:14258",
+  "http://127.0.0.1:14259",
+]
+
+[path."/test.TestAPI/TestBiStream"]
+urls = [
+  "http://127.0.0.1:14250",
+  "http://127.0.0.1:14254",
+  "http://127.0.0.1:14259",
+]
+
+[path."/test.TestAPI/TestBiAbsUpDown"]
+urls = [
+  "http://127.0.0.1:14250",
+  "http://127.0.0.1:14255",
+]
+
+[path."/test.TestAPI/TestBiPctUpDown"]
+urls = [
+  "http://127.0.0.1:14250",
+  "http://127.0.0.1:14256",
+]
+
+[path."/test.TestAPI/TestBiPct"]
+urls = [
+  "http://127.0.0.1:14250",
+  "http://127.0.0.1:14257",
+]

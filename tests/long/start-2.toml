@@ -1,8 +1,11 @@
-[proxy]
-addr = [
-  "127.0.0.1:14221",
-  { addr = "127.0.0.1:14222", secure = false },
+[grpc-proxy]
+listeners = [
+  { addr = "127.0.0.1:14221" },
+  { addr = "127.0.0.1:14222", cert-path = "", key-path = "" },
 ]
-[addrs]
-"http://127.0.0.1:14252" = [ "/test.TestClientStream" ]
-"127.0.0.1:14253" = [ "/test.TestServerStream" ]
+
+[path."/test.TestAPI/TestClientStream"]
+urls = ["http://127.0.0.1:14252"]
+
+[path."/test.TestAPI/TestServerStream"]
+urls = ["http://127.0.0.1:14253"]

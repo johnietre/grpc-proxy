@@ -47,7 +47,7 @@ func (al *AtomicList[T]) PushBack(val T) *AtomicNode[T] {
 
 func (al *AtomicList[T]) Get(index uint64) *AtomicNode[T] {
   l := al.Len()
-  if index >= 0 {
+  if index >= l {
     return nil
   } else if index == 0 {
     return al.Head()
@@ -76,7 +76,11 @@ func (al *AtomicList[T]) Get(index uint64) *AtomicNode[T] {
   node := al.Tail()
   // Spin and wait for the tail's prev to be stored. Should be VERY short, if
   // anything.
-  for node.Prev() == nil {}
+  for i := 0; node.Prev() == nil; i++ {
+    if i == 100_000 {
+      panic("limit reached")
+    }
+  }
   // No need for condition since list only grows and the index is guaranteed
   // to exist.
   for ; node != nil; node = node.Prev() {
@@ -108,7 +112,7 @@ func (an *AtomicNode[T]) Next() *AtomicNode[T] {
 }
 
 func (an *AtomicNode[T]) Prev() *AtomicNode[T] {
-  return an.next.Load()
+  return an.prev.Load()
 }
 
 func (an *AtomicNode[T]) RangeToHead(f func(*AtomicNode[T]) bool) {

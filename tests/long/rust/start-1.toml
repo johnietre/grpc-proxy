@@ -1,0 +1,6 @@
+[proxy]
+addr = "127.0.0.1:14211"
+[paths]
+"/test.TestAPI/Test" = "http://127.0.0.1:14251"
+[addrs]
+"http://127.0.0.1:14254" = [ "/test.TestAPI/TestBiStream" ]

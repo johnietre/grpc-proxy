@@ -1,6 +1,10 @@
-[proxy]
-addr = "127.0.0.1:14211"
-[paths]
-"/test.Test" = "http://127.0.0.1:14251"
-[addrs]
-"http://127.0.0.1:14254" = [ "/test.TestBiStream" ]
+[grpc-proxy]
+listeners = [
+  { addr = "127.0.0.1:14211" },
+]
+
+[path."/test.TestAPI/Test"]
+urls = [ "http://127.0.0.1:14251" ]
+
+[path."/test.TestAPI/TestBiStream"]
+urls = [ "http://127.0.0.1:14254" ]

@@ -1,35 +1,55 @@
-[proxy]
-addr = [
-  { addr = "127.0.0.1:14201", secure = false },
-  "http://127.0.0.1:14202",
-  { addr = "127.0.0.1:14203", secure = false },
-  "http://127.0.0.1:14204",
+[grpc-proxy]
+listeners = [
+  { addr = "127.0.0.1:14201" },
+  { addr = "127.0.0.1:14202" },
+  { addr = "127.0.0.1:14203" },
+  { addr = "127.0.0.1:14204" }, 
 ]
-[paths]
-"/test.Test" = [ "127.0.0.1:14251" ]
-"/test.TestClientStream" = [ "127.0.0.1:14252" ]
-"/test.TestServerStream" = [ "127.0.0.1:14253" ]
-"/test.TestBiStream" = [ "127.0.0.1:14254" ]
-"/test.TestBiAbsUpDown" = [ "127.0.0.1:14255" ]
-"/test.TestBiPctUpDown" = [ "127.0.0.1:14256" ]
-"/test.TestBiPct" = [ "127.0.0.1:14257" ]
-[addrs]
-"127.0.0.1:14250" = [
-  "/test.Test",
-  "/test.TestClientStream",
-  "/test.TestServerStream",
-  "/test.TestBiStream",
-  "/test.TestBiAbsUpDown",
-  "/test.TestBiPctUpDown",
-  "/test.TestBiPct",
+
+[path."/test.TestAPI/Test"]
+urls = [
+  "http://127.0.0.1:14250",
+  "http://127.0.0.1:14251",
+  "http://127.0.0.1:14259",
 ]
-"127.0.0.1:14258" = [
-  "/test.TestClientStream",
-  "/test.TestClientServer",
+
+[path."/test.TestAPI/TestClientStream"]
+urls = [
+  "http://127.0.0.1:14250",
+  "http://127.0.0.1:14252",
+  "http://127.0.0.1:14258",
+  "http://127.0.0.1:14259",
 ]
-"127.0.0.1:14259" = [
-  "/test.Test",
-  "/test.TestClientStream",
-  "/test.TestServerStream",
-  "/test.TestBiStream",
+
+[path."/test.TestAPI/TestServerStream"]
+urls = [
+  "http://127.0.0.1:14250",
+  "http://127.0.0.1:14253",
+  "http://127.0.0.1:14258",
+  "http://127.0.0.1:14259",
+]
+
+[path."/test.TestAPI/TestBiStream"]
+urls = [
+  "http://127.0.0.1:14250",
+  "http://127.0.0.1:14254",
+  "http://127.0.0.1:14259",
+]
+
+[path."/test.TestAPI/TestBiAbsUpDown"]
+urls = [
+  "http://127.0.0.1:14250",
+  "http://127.0.0.1:14255",
+]
+
+[path."/test.TestAPI/TestBiPctUpDown"]
+urls = [
+  "http://127.0.0.1:14250",
+  "http://127.0.0.1:14256",
+]
+
+[path."/test.TestAPI/TestBiPct"]
+urls = [
+  "http://127.0.0.1:14250",
+  "http://127.0.0.1:14257",
 ]

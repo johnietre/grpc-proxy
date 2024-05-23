@@ -26,6 +26,14 @@ func GetBinPath(release bool) string {
   )
 }
 
+func GetGoPath() string {
+  _, thisFile, _, _ := runtime.Caller(0)
+  return filepath.Join(
+    filepath.Dir(filepath.Dir(thisFile)),
+    "bin", "grpc-proxy",
+  )
+}
+
 func GetConfigPath(name string) string {
   _, thisFile, _, _ := runtime.Caller(0)
   return filepath.Join(filepath.Dir(thisFile), "confs", name)
@@ -49,6 +57,9 @@ func Timeout(dur time.Duration, f func()) bool {
   case <-c:
   case <-timer.C:
     return false
+  }
+  if !timer.Stop() {
+    <-timer.C
   }
   return true
 }
@@ -170,5 +181,13 @@ func Must[T any](t T, err error) T {
 func TimeTest(name string, test func()) {
   start := time.Now()
   test()
-  fmt.Printf("PASSED: %s (%f seconds)", name, time.Since(start).Seconds())
+  fmt.Printf("PASSED: %s (%f seconds)\n", name, time.Since(start).Seconds())
+}
+
+func TimedTest(dur time.Duration, name string, test func()) {
+  start := time.Now()
+  if !Timeout(dur, test) {
+    Fatalf("%s: timed out (%f seconds)", name, dur.Seconds())
+  }
+  fmt.Printf("PASSED: %s (%f seconds)\n", name, time.Since(start).Seconds())
 }

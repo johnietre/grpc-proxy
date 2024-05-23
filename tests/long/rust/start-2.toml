@@ -1,0 +1,8 @@
+[proxy]
+addr = [
+  "127.0.0.1:14221",
+  { addr = "127.0.0.1:14222", secure = false },
+]
+[addrs]
+"http://127.0.0.1:14252" = [ "/test.TestAPI/TestClientStream" ]
+"127.0.0.1:14253" = [ "/test.TestAPI/TestServerStream" ]
