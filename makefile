@@ -1,7 +1,7 @@
 .PHONY: go
 
 go:
-	go build -o bin/grpc-proxy ./cmd
+	go build -o bin/grpc-proxy ./cmd/grpc-proxy
 
 test-proto: tests/proto/*.proto
 	protoc \
