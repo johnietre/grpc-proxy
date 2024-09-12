@@ -14,13 +14,16 @@ Currently the Go implementation is far faster than the Rust implementation (at l
 # TODO
 - [ ] Go improve command/flag descriptions
 - [ ] Improve/move test output to subdirectory
-- [ ] Fix --out flag for refresh
+- [x] Fix --out flag for refresh
 - [ ] Add more options to better control tests
 - [ ] Add tests to go directory for individual things (standard Go tests)
 - [ ] Test all that's yet to be tested
     - [ ] Status
 - [ ] Logging
+    - [x] Add logs where there are TODOs
+    - [ ] Log messages
 - [ ] Add optional retry timer for srvr0 when it disconnects
 - [ ] Allow specifying paths per URL (in addition to URLs per path)
     - Possibly add new option to "generate" command to convert paths per URL to URLs per path
 - [ ] Command to make proxy replace config at its config path with current config
+- [ ] Print error when using refresh command and no address is specified

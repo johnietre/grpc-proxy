@@ -132,6 +132,7 @@ func (a *App) proxy(w http.ResponseWriter, r *http.Request) {
 	if proxy == nil {
 		// TODO: LOG
 		// TODO: Status code
+		log.Print("nil proxy after getting/searching for proxy")
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
@@ -181,13 +182,19 @@ func (a *App) handle(w http.ResponseWriter, r *http.Request) {
 	if !f(w, r) {
 		return
 	}
+	encoded, err := []byte{}, error(nil)
 	a.config.RApply(func(cfg *Config) {
-		if err := json.NewEncoder(w).Encode(cfg); err != nil {
-			// TODO
-		}
+		encoded, err = json.Marshal(cfg)
 	})
+	if err != nil {
+		// TODO: LOG
+		log.Print("error encoding config: ", err)
+	} else {
+		w.Write(encoded)
+	}
 }
 
+// These functions return whether the config should be sent afterwards
 func (a *App) handleGet(w http.ResponseWriter, r *http.Request) (ok bool) {
 	getConfig, _ := strconv.ParseBool(r.URL.Query().Get("config"))
 	getStatus, _ := strconv.ParseBool(r.URL.Query().Get("status"))
@@ -217,10 +224,24 @@ func (a *App) handleGet(w http.ResponseWriter, r *http.Request) (ok bool) {
 					statuses[srvr.LnConfig.Addr.String()] = "SHUTTING DOWN"
 				case StatusStopped:
 					statuses[srvr.LnConfig.Addr.String()] = "STOPPED"
+				default:
+					statuses[srvr.LnConfig.Addr.String()] = "UNKNOWN"
 				}
 				srvr.status.Load()
 			}
 		})
+		if a.srvr0 != nil {
+			switch a.srvr0.status.Load() {
+			case StatusRunning:
+				statuses[a.srvr0.LnConfig.Addr.String()] = "RUNNING"
+			case StatusShuttingDown:
+				statuses[a.srvr0.LnConfig.Addr.String()] = "SHUTTING DOWN"
+			case StatusStopped:
+				statuses[a.srvr0.LnConfig.Addr.String()] = "STOPPED"
+			default:
+				statuses[a.srvr0.LnConfig.Addr.String()] = "UNKNOWN"
+			}
+		}
 		if err := json.NewEncoder(buf).Encode(statuses); err != nil {
 			errMsg := fmt.Sprint("error serializing statuses: ", err)
 			log.Print(errMsg)

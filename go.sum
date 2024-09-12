@@ -5,6 +5,8 @@ github.com/inconshreveable/mousetrap v1.1.0 h1:wN+x4NVGpMsO7ErUn/mUI3vEoE6Jt13X2
 github.com/inconshreveable/mousetrap v1.1.0/go.mod h1:vpF70FUmC8bwa3OWnCshd2FqLfsEA9PFc4w1p2J65bw=
 github.com/johnietre/utils/go v0.0.0-20240514030306-cbc5817d8c89 h1:Faldgbs61JYR24L/TG3YOr+nzcJE51xMUTjN9If8USM=
 github.com/johnietre/utils/go v0.0.0-20240514030306-cbc5817d8c89/go.mod h1:EIHQk2LLgdrOzVqAfAAmDOwjQUB+j0lLB22TNRE0Xyk=
+github.com/johnietre/utils/go v0.0.0-20240824235850-02a29745ef87 h1:BEAmLzvaZxGCp8M8gI3hNPuxn4GaccSJ+i6tgQdJPM8=
+github.com/johnietre/utils/go v0.0.0-20240824235850-02a29745ef87/go.mod h1:EIHQk2LLgdrOzVqAfAAmDOwjQUB+j0lLB22TNRE0Xyk=
 github.com/russross/blackfriday/v2 v2.1.0/go.mod h1:+Rmxgy9KzJVeS9/2gXHxylqXiyQDYRxCVz55jmeOWTM=
 github.com/spf13/cobra v1.8.0 h1:7aJaZx1B85qltLMc546zn58BxxfZdR/W22ej9CFoEf0=
 github.com/spf13/cobra v1.8.0/go.mod h1:WXLWApfZ71AjXPya3WOlMsY9yMs7YeiHhFVlvLyhcho=

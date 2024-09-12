@@ -19,6 +19,7 @@ func makeShutdownCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "shutdown",
 		Short: "Shutdown a proxy",
+		Args:  cobra.MaximumNArgs(0),
 		Run:   runShutdown,
 	}
 	flags := cmd.Flags()

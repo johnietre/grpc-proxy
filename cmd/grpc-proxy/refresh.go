@@ -19,6 +19,7 @@ func makeRefreshCmd() *cobra.Command {
 		Use:   "refresh",
 		Short: "Refresh a proxy",
 		Long:  `Refresh a proxy. Without specifying "--add" or "--del", the config on each proxy specified is completely replaced.`,
+		Args:  cobra.MaximumNArgs(0),
 		Run:   runRefresh,
 	}
 	flags := cmd.Flags()
@@ -93,6 +94,9 @@ func runRefresh(cmd *cobra.Command, args []string) {
 		}
 		return url
 	})
+	if len(urls) == 0 {
+		log.Fatal("Must provide at least one URL")
+	}
 
 	handleResp := func(resp *http.Response) error {
 		defer resp.Body.Close()
@@ -107,7 +111,7 @@ func runRefresh(cmd *cobra.Command, args []string) {
 				"Received %d status with body: %s", resp.StatusCode, body,
 			)
 		}
-		fmt.Printf("%s: SUCCESS", req.URL)
+		fmt.Printf("%s: SUCCESS\n", req.URL)
 		f := os.Stdout
 		if outDir != "" {
 			var err error

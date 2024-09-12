@@ -15,6 +15,7 @@ func main() {
 	}
 	rootCmd.AddCommand(
 		makeGenerateCmd(), makeStartCmd(), makeRefreshCmd(), makeShutdownCmd(),
+		makeStatusCmd(),
 	)
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
